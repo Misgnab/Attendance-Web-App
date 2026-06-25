@@ -1,0 +1,11 @@
+{
+  "name": "B square Y Attendance",
+  "description": "Streamlined attendance and leave management system featuring real-time analytics and employee check-ins.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
