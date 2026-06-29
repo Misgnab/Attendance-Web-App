@@ -2,10 +2,12 @@ export interface User {
   id: number;
   full_name: string;
   phone_number: string;
-  role: "Admin" | "Employee";
+  role: "Bootstrap" | "AdminCreator" | "AdminManager" | "SuperAdmin" | "Employee" | "Purchaser" | "Accountant" | "Engineer" | "HR";
   photo?: string;
   hourly_rate: number;
   registration_date?: string;
+  workspace_id?: number | null;
+  workspace_name?: string;
 }
 
 export interface AttendanceRecord {
