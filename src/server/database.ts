@@ -82,10 +82,7 @@ function migrateUsersTable() {
 }
 
 export function initDatabase() {
-  // Run table migration
-  migrateUsersTable();
-
-  // Create Workspaces Table
+  // 1. Create Workspaces Table FIRST as it is referenced by others
   db.exec(`
     CREATE TABLE IF NOT EXISTS workspaces (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +99,10 @@ export function initDatabase() {
 
   const defaultWorkspaceId = (db.prepare("SELECT id FROM workspaces ORDER BY id ASC LIMIT 1").get() as any).id;
 
-  // Create Users Table
+  // 2. Run user table migration (now workspaces table exists)
+  migrateUsersTable();
+
+  // 3. Create Users Table
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +114,8 @@ export function initDatabase() {
       hourly_rate REAL DEFAULT 15.00,
       registration_date TEXT DEFAULT CURRENT_TIMESTAMP,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL
     )
   `);
 
@@ -131,6 +132,7 @@ export function initDatabase() {
       status TEXT DEFAULT 'Present',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
       UNIQUE(user_id, date, session)
     )
@@ -149,6 +151,7 @@ export function initDatabase() {
       status TEXT NOT NULL DEFAULT 'Pending',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     )
   `);
@@ -167,6 +170,7 @@ export function initDatabase() {
       status TEXT NOT NULL DEFAULT 'Pending',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     )
   `);
@@ -184,6 +188,7 @@ export function initDatabase() {
       period_end TEXT NOT NULL,
       period_type TEXT NOT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     )
   `);
@@ -209,7 +214,8 @@ export function initDatabase() {
       code TEXT UNIQUE NOT NULL,
       generated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       expires_at TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL
     )
   `);
 
@@ -223,30 +229,10 @@ export function initDatabase() {
       wifi_ssid TEXT DEFAULT 'Apex_HQ_WiFi',
       wifi_ip TEXT DEFAULT '192.168.1.100',
       use_wifi_verification INTEGER DEFAULT 1,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      workspace_id INTEGER UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE
     )
   `);
-
-  // Safely add workspace_id to tables if they don't exist
-  function addColumnIfNotExists(tableName: string, colName: string, colDef: string) {
-    try {
-      const tableInfo: any[] = db.prepare(`PRAGMA table_info(${tableName})`).all();
-      const exists = tableInfo.some((col: any) => col.name === colName);
-      if (!exists) {
-        db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${colName} ${colDef}`);
-      }
-    } catch (err) {
-      console.error(`Migration error adding ${colName} to ${tableName}:`, err);
-    }
-  }
-
-  addColumnIfNotExists("users", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("attendance", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("attendance_requests", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("permissions", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("salary_payments", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("qr_codes", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
-  addColumnIfNotExists("site_settings", "workspace_id", "INTEGER REFERENCES workspaces(id) ON DELETE SET NULL");
 
   // Retroactively fill workspace_id for rows where it is NULL
   try {
@@ -272,7 +258,7 @@ export function initDatabase() {
   `);
 
   // Seed default Site Settings for default workspace if not exists
-  const settingsCheck = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ? OR (workspace_id IS NULL AND id = 1)").get(defaultWorkspaceId);
+  const settingsCheck = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(defaultWorkspaceId);
   if (!settingsCheck) {
     db.prepare(`
       INSERT INTO site_settings (office_name, latitude, longitude, wifi_ssid, wifi_ip, use_wifi_verification, workspace_id)

@@ -52,7 +52,7 @@ interface AppState {
   // Common/Employee Actions
   fetchTodayAttendance: () => Promise<void>;
   checkIn: (qrCode?: string, locData?: { latitude?: number; longitude?: number; accuracy?: number; wifi_ssid?: string; wifi_ip?: string }) => Promise<{ success: boolean; error?: string; session?: string }>;
-  checkOut: (locData?: { latitude?: number; longitude?: number; accuracy?: number; wifi_ssid?: string; wifi_ip?: string }) => Promise<{ success: boolean; error?: string; session?: string }>;
+  checkOut: (qrCode?: string, locData?: { latitude?: number; longitude?: number; accuracy?: number; wifi_ssid?: string; wifi_ip?: string }) => Promise<{ success: boolean; error?: string; session?: string }>;
   fetchAttendanceHistory: () => Promise<void>;
   fetchPermissions: () => Promise<void>;
   submitPermission: (data: { request_type: string; reason: string; start_date: string; end_date: string }) => Promise<boolean>;
@@ -179,6 +179,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (res.ok) {
         const data = await res.json();
         get().setUser(data);
+      } else if (res.status === 401) {
+        get().logout();
       }
     } catch (err) {
       console.error("Fetch profile failed", err);
@@ -225,16 +227,26 @@ export const useAppStore = create<AppState>((set, get) => ({
         },
         body: JSON.stringify(data),
       });
-      const resData = await res.json();
+      
+      let resData;
+      const resText = await res.text();
+      try {
+        resData = JSON.parse(resText);
+      } catch (e) {
+        console.error("Failed to parse registration response as JSON. Response text:", resText, e);
+        return { success: false, error: `Server error (${res.status}): Non-JSON response. See console for details.` };
+      }
+      
       set({ loading: false });
-      if (!res.ok) {
+      if (!res.ok || (resData && resData.success === false)) {
         return { success: false, error: resData.error || "Registration failed" };
       }
       get().fetchEmployees(); // Refresh employee list
       return { success: true };
-    } catch (err) {
+    } catch (err: any) {
+      console.error("Registration fetch error:", err);
       set({ loading: false });
-      return { success: false, error: "Network connection failed" };
+      return { success: false, error: `Network connection failed: ${err.message || 'Unknown error'}` };
     }
   },
 
@@ -372,7 +384,14 @@ export const useAppStore = create<AppState>((set, get) => ({
           ...locData
         }),
       });
-      const data = await res.json();
+      
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        return { success: false, error: "Server error: Non-JSON response" };
+      }
+
       if (res.ok) {
         get().fetchTodayAttendance();
         get().fetchAttendanceHistory();
@@ -381,12 +400,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         return { success: false, error: data.error };
       }
-    } catch (err) {
-      return { success: false, error: "Network error during check-in" };
+    } catch (err: any) {
+      console.error("Check-in fetch error:", err);
+      return { success: false, error: `Network error during check-in: ${err.message}` };
     }
   },
 
-  checkOut: async (locData) => {
+  checkOut: async (qrCode, locData) => {
     const { token } = get();
     if (!token) return { success: false, error: "Not authenticated" };
     try {
@@ -397,10 +417,18 @@ export const useAppStore = create<AppState>((set, get) => ({
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
+          qr_code: qrCode,
           ...locData
         })
       });
-      const data = await res.json();
+
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        return { success: false, error: "Server error: Non-JSON response" };
+      }
+
       if (res.ok) {
         get().fetchTodayAttendance();
         get().fetchAttendanceHistory();
@@ -409,8 +437,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         return { success: false, error: data.error };
       }
-    } catch (err) {
-      return { success: false, error: "Network error during check-out" };
+    } catch (err: any) {
+      console.error("Check-out fetch error:", err);
+      return { success: false, error: `Network error during check-out: ${err.message}` };
     }
   },
 

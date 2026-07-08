@@ -4,13 +4,27 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { createServer as createViteServer } from "vite";
 import { db, initDatabase } from "./src/server/database.js";
-import { toEthiopian } from "ethiopian-date";
+import { toEthiopian, toGregorian } from "ethiopian-date";
 
 // Initialize the database and seed it
 initDatabase();
 
 const app = express();
 const PORT = 3000;
+console.log(`Starting server. NODE_ENV: ${process.env.NODE_ENV}`);
+
+// Request logger
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || "construction-company-secret-key-2026";
 
 // --- ETHIOPIAN TIMEZONE & CALENDAR HELPER FUNCTIONS (Africa/Addis_Ababa, UTC+3) ---
@@ -48,6 +62,22 @@ function getEthiopianDateString(date: Date = new Date()): string {
       day: '2-digit'
     });
     return formatter.format(date);
+  }
+}
+
+function convertGregorianToEthiopianDate(gDateStr: string): string {
+  if (!gDateStr) return gDateStr;
+  try {
+    const parts = gDateStr.split("-");
+    if (parts.length !== 3) return gDateStr;
+    const y = parseInt(parts[0]);
+    const m = parseInt(parts[1]);
+    const d = parseInt(parts[2]);
+    if (isNaN(y) || isNaN(m) || isNaN(d)) return gDateStr;
+    const [ey, em, ed] = toEthiopian(y, m, d);
+    return `${ey}-${String(em).padStart(2, "0")}-${String(ed).padStart(2, "0")}`;
+  } catch (e) {
+    return gDateStr;
   }
 }
 
@@ -96,23 +126,50 @@ interface AuthenticatedRequest extends Request {
 
 // --- JWT AUTHENTICATION MIDDLEWARE ---
 function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
 
-  if (!token) {
-    return res.status(401).json({ error: "Access token is required" });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: "Invalid or expired token" });
+    if (!token) {
+      console.log("Auth failed: Missing token");
+      return res.status(401).json({ error: "Access token is required" });
     }
-    req.user = user as any;
-    next();
-  });
+
+    jwt.verify(token, JWT_SECRET, (err, user: any) => {
+      if (err) {
+        console.log(`Auth failed: JWT verify error: ${err.message}`);
+        return res.status(401).json({ error: "Invalid or expired token" });
+      }
+      
+      // Check if user still exists in DB to prevent stale token issues after DB reset
+      try {
+        const dbUser = db.prepare("SELECT id, role, workspace_id, full_name, phone_number FROM users WHERE id = ?").get(user.id) as any;
+        if (!dbUser) {
+          console.log(`Auth failed: User ${user.id} not found in DB`);
+          return res.status(401).json({ error: "User session is invalid. Please log in again." });
+        }
+        req.user = { ...user, ...dbUser };
+        console.log(`Auth successful: User ${req.user.full_name} (${req.user.role})`);
+        next();
+      } catch (dbErr) {
+        console.error("Auth middleware DB error:", dbErr);
+        return res.status(500).json({ error: "Internal server error during authentication" });
+      }
+    });
+  } catch (err) {
+    console.error("Critical auth middleware error:", err);
+    res.status(500).json({ error: "Internal server error in auth middleware" });
+  }
 }
 
 // --- MODULE 6: AUTHENTICATION & REGISTRATION API ---
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.get("/api/test-json", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
+  res.json({ test: "ok", user: req.user });
+});
 
 // Login Endpoint
 app.post("/api/auth/login", (req: Request, res: Response) => {
@@ -196,7 +253,7 @@ app.post("/api/auth/setup-admin", (req: Request, res: Response) => {
       VALUES (?, ?, 'Bootstrap', ?, 35.00, NULL)
     `).run(full_name, phone_number, passwordHash);
 
-    const userId = result.lastInsertRowid;
+    const userId = Number(result.lastInsertRowid);
 
     // Initialize attendance score for the new admin
     db.prepare(`
@@ -232,14 +289,20 @@ app.post("/api/auth/setup-admin", (req: Request, res: Response) => {
 
 // Register Employee / Admin Endpoint (Multi-tenant)
 app.post("/api/employees/register", authenticateToken, (req: AuthenticatedRequest, res: Response) => {
+  console.log("Entering /api/employees/register handler");
   const currentRole = req.user?.role;
   const currentWorkspaceId = req.user?.workspace_id;
 
-  if (currentRole === "SuperAdmin" || !["AdminCreator", "AdminManager", "Bootstrap"].includes(currentRole || "")) {
-    return res.status(403).json({ error: "Access denied. Write operations forbidden." });
+  console.log("Registration request by:", currentRole, "for workspace:", currentWorkspaceId);
+
+  const allowedRoles = ["AdminCreator", "AdminManager", "Bootstrap", "SuperAdmin"];
+  if (!allowedRoles.includes(currentRole || "")) {
+    console.log(`Access denied for role: ${currentRole}`);
+    return res.status(400).json({ success: false, error: "Access denied. Write operations forbidden." });
   }
 
   const { full_name, phone_number, role, password, photo, hourly_rate, workspace_name } = req.body;
+  console.log("Registering employee:", { full_name, phone_number, role, hourly_rate });
 
   if (!full_name || !phone_number || !role || !password) {
     return res.status(400).json({ error: "Full name, phone number, role, and password are required" });
@@ -282,7 +345,6 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
       targetWorkspaceId = currentWorkspaceId;
     } else {
       // It's a newly registered Admin
-      // When a new Admin is created (AdminCreator or AdminManager), they must be assigned a unique, isolated Workspace.
       if (role === "AdminCreator" || role === "AdminManager") {
         const wName = workspace_name || `Workspace for ${full_name}`;
         
@@ -293,7 +355,7 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
         }
 
         const wResult = db.prepare("INSERT INTO workspaces (name) VALUES (?)").run(cleanName);
-        targetWorkspaceId = wResult.lastInsertRowid as number;
+        targetWorkspaceId = Number(wResult.lastInsertRowid);
 
         // Seed site settings for the new workspace!
         db.prepare(`
@@ -311,12 +373,19 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
       }
     }
 
+    if (targetWorkspaceId !== null) {
+      const workspaceExists = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(targetWorkspaceId);
+      if (!workspaceExists) {
+        return res.status(400).json({ error: "Assigned workspace no longer exists. Please contact support." });
+      }
+    }
+
     const result = db.prepare(`
       INSERT INTO users (full_name, phone_number, role, password, photo, hourly_rate, workspace_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(full_name, phone_number, role, passwordHash, photo || null, rateValue, targetWorkspaceId);
 
-    const userId = result.lastInsertRowid;
+    const userId = Number(result.lastInsertRowid);
 
     // Initialize attendance score
     db.prepare(`
@@ -324,7 +393,7 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
       VALUES (?, 100.0, 100.0, 0)
     `).run(userId);
 
-    res.json({
+    const responsePayload = {
       success: true,
       user: {
         id: userId,
@@ -334,7 +403,16 @@ app.post("/api/employees/register", authenticateToken, (req: AuthenticatedReques
         hourly_rate: rateValue,
         workspace_id: targetWorkspaceId
       },
-    });
+    };
+    
+    console.log("Registration successful, sending response");
+    try {
+      JSON.stringify(responsePayload);
+      res.json(responsePayload);
+    } catch (jsonErr) {
+      console.error("JSON serialization error in registration:", jsonErr);
+      res.status(500).json({ error: "Response serialization failed" });
+    }
   } catch (error: any) {
     console.error("Employee registration error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -691,6 +769,12 @@ app.get("/api/site-settings", authenticateToken, (req: AuthenticatedRequest, res
   }
 
   try {
+    // Verify workspace existence first to avoid foreign key errors with stale data
+    const workspace = db.prepare("SELECT id FROM workspaces WHERE id = ?").get(workspaceId);
+    if (!workspace) {
+      return res.status(403).json({ error: "Your assigned workspace no longer exists. Please log in again." });
+    }
+
     let settings = db.prepare("SELECT * FROM site_settings WHERE workspace_id = ?").get(workspaceId);
     if (!settings) {
       // Seed site settings for this workspace
@@ -774,7 +858,7 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
   // Determine active session strictly based on check-in time (before 06:00 Ethiopian time / 12:00 PM standard is Morning):
   const activeSession = nowTimeStr < "06:00:00" ? "Morning" : "Afternoon";
 
-  const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
+  const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
     // Prevent simultaneous attendance:
@@ -801,9 +885,8 @@ app.post("/api/attendance/check-in", authenticateToken, (req: AuthenticatedReque
     if (existing) {
       return res.status(400).json({ error: `You have already attended the ${activeSession} session today` });
     }
-
     // Employee must satisfy Wi-Fi IP Mode OR QR + GPS Fallback
-    if (employeeRoles.includes(req.user?.role || "")) {
+    if (complianceRoles.includes(req.user?.role || "")) {
       const workspaceId = req.user?.workspace_id;
       if (!workspaceId) {
         return res.status(400).json({ error: "User does not belong to any workspace" });
@@ -880,8 +963,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
   const { qr_code, latitude, longitude, accuracy, wifi_ssid, wifi_ip, session, simulated_time } = req.body;
   const todayStr = getEthiopianDateString();
   const nowTimeStr = simulated_time || getEthiopianTimeString(); // HH:MM:SS
-
-  const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
+  const complianceRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR", "AdminCreator", "AdminManager"];
 
   try {
     let record: any;
@@ -900,7 +982,7 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     }
 
     // Employee must satisfy Wi-Fi IP Mode OR QR + GPS Fallback to check out
-    if (employeeRoles.includes(req.user?.role || "")) {
+    if (complianceRoles.includes(req.user?.role || "")) {
       const workspaceId = req.user?.workspace_id;
       if (!workspaceId) {
         return res.status(400).json({ error: "User does not belong to any workspace" });
@@ -952,7 +1034,8 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
     const checkInMinutes = parseInt(checkInParts[0]) * 60 + parseInt(checkInParts[1]);
     const checkOutMinutes = parseInt(checkOutParts[0]) * 60 + parseInt(checkOutParts[1]);
 
-    const diffMinutes = checkOutMinutes - checkInMinutes;
+    let diffMinutes = checkOutMinutes - checkInMinutes;
+    if (diffMinutes < 0) diffMinutes += 24 * 60; // Handle overnight shifts
     const totalHours = Math.max(0, parseFloat((diffMinutes / 60).toFixed(2)));
 
     db.prepare(`
@@ -975,16 +1058,44 @@ app.post("/api/attendance/check-out", authenticateToken, (req: AuthenticatedRequ
 function updateAttendanceScore(userId: number) {
   try {
     const records: any[] = db.prepare("SELECT * FROM attendance WHERE user_id = ?").all(userId);
-    if (records.length === 0) return;
+    const approvedPermissions: any[] = db.prepare(`
+      SELECT * FROM permissions 
+      WHERE user_id = ? AND status = 'Approved'
+    `).all(userId);
 
-    const totalDays = records.length;
+    // Create a set of dates where user was present or had permission
+    const presentDates = new Set<string>();
+    records.forEach(r => {
+      if (["Present", "Late", "Permission", "Authorized"].includes(r.status)) {
+        presentDates.add(r.date);
+      }
+    });
+
+    approvedPermissions.forEach(p => {
+      const dates = getDatesInRange(p.approved_from_date || p.start_date, p.approved_to_date || p.end_date);
+      dates.forEach(d => presentDates.add(d));
+    });
+
+    const totalDays = records.length; // This might be problematic if we want to include days they were only present via permission
+    // Actually, totalDays should probably be the union of attendance record dates and permission dates in the relevant period.
+    // But let's keep it simple for now as per current logic but just adjust presentCount.
+
     const lateCount = records.filter(r => r.status === "Late").length;
-    const presentCount = records.filter(r => r.status === "Present" || r.status === "Late").length;
-
-    const punctualityPercentage = totalDays > 0 ? parseFloat(((presentCount - lateCount) / presentCount * 100).toFixed(1)) : 100.0;
+    const presentCount = presentDates.size;
     
-    // Attendance Score: Base rate of present vs total days, penalty for lates, reward for total hours
-    const presentRatio = totalDays > 0 ? (presentCount / totalDays) * 100 : 100.0;
+    // Adjust totalDays if there are permissions on dates with no attendance record
+    const allRelevantDates = new Set<string>();
+    records.forEach(r => allRelevantDates.add(r.date));
+    approvedPermissions.forEach(p => {
+      const dates = getDatesInRange(p.approved_from_date || p.start_date, p.approved_to_date || p.end_date);
+      dates.forEach(d => allRelevantDates.add(d));
+    });
+    
+    const adjustedTotalDays = allRelevantDates.size;
+
+    const punctualityPercentage = presentCount > 0 ? parseFloat(((presentCount - lateCount) / presentCount * 100).toFixed(1)) : 100.0;
+    
+    const presentRatio = adjustedTotalDays > 0 ? (presentCount / adjustedTotalDays) * 100 : 100.0;
     const attendanceScore = parseFloat((punctualityPercentage * 0.5 + presentRatio * 0.5).toFixed(1));
 
     db.prepare(`
@@ -1002,18 +1113,29 @@ function updateAttendanceScore(userId: number) {
 }
 
 function getDatesInRange(startStr: string, endStr: string): string[] {
-  const dates: string[] = [];
-  const start = new Date(startStr);
-  const end = new Date(endStr);
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+  try {
+    const dates: string[] = [];
+    const [sy, sm, sd] = startStr.split("-").map(Number);
+    const [ey, em, ed] = endStr.split("-").map(Number);
+    
+    if (!sy || !sm || !sd || !ey || !em || !ed) return [startStr];
+
+    const currentG = toGregorian(sy, sm, sd);
+    const endG = toGregorian(ey, em, ed);
+    
+    const currDate = new Date(currentG[0], currentG[1] - 1, currentG[2]);
+    const endDate = new Date(endG[0], endG[1] - 1, endG[2]);
+    
+    while (currDate <= endDate) {
+      const [eyy, emm, edd] = toEthiopian(currDate.getFullYear(), currDate.getMonth() + 1, currDate.getDate());
+      dates.push(`${eyy}-${String(emm).padStart(2, "0")}-${String(edd).padStart(2, "0")}`);
+      currDate.setDate(currDate.getDate() + 1);
+    }
+    return dates;
+  } catch (err) {
+    console.error("Error in getDatesInRange:", err);
     return [startStr];
   }
-  const current = new Date(start);
-  while (current <= end) {
-    dates.push(current.toISOString().split("T")[0]);
-    current.setDate(current.getDate() + 1);
-  }
-  return dates;
 }
 
 // Fetch all attendance logs (SuperAdmin sees all, Bootstrap sees none, Admin sees workspace, Employee sees own)
@@ -1022,7 +1144,7 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
   const currentWorkspaceId = req.user?.workspace_id;
 
   try {
-    let logs;
+    let logs: any[];
     if (currentRole === "SuperAdmin") {
       logs = db.prepare(`
         SELECT a.*, u.full_name, u.phone_number, u.role, w.name as workspace_name
@@ -1052,7 +1174,63 @@ app.get("/api/attendance/history", authenticateToken, (req: AuthenticatedRequest
         ORDER BY a.date DESC, a.check_in_time DESC
       `).all(req.user?.id);
     }
-    res.json(logs);
+
+    // Synthesize "Present" records for approved permissions
+    let permissions: any[];
+    if (currentRole === "SuperAdmin") {
+      permissions = db.prepare(`
+        SELECT p.*, u.full_name, u.phone_number, u.role, w.name as workspace_name
+        FROM permissions p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN workspaces w ON p.workspace_id = w.id
+        WHERE p.status = 'Approved'
+      `).all();
+    } else if (currentRole === "AdminCreator" || currentRole === "AdminManager") {
+      permissions = db.prepare(`
+        SELECT p.*, u.full_name, u.phone_number, u.role, w.name as workspace_name
+        FROM permissions p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN workspaces w ON p.workspace_id = w.id
+        WHERE p.status = 'Approved' AND p.workspace_id = ?
+      `).all(currentWorkspaceId);
+    } else {
+      permissions = db.prepare(`
+        SELECT p.*, u.full_name, u.phone_number, u.role, w.name as workspace_name
+        FROM permissions p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN workspaces w ON p.workspace_id = w.id
+        WHERE p.status = 'Approved' AND p.user_id = ?
+      `).all(req.user?.id);
+    }
+
+    const mergedLogs = [...logs];
+    permissions.forEach(p => {
+      const dates = getDatesInRange(p.approved_from_date || p.start_date, p.approved_to_date || p.end_date);
+      dates.forEach(d => {
+        ['Morning', 'Afternoon'].forEach(sess => {
+          const exists = logs.some(l => l.user_id === p.user_id && l.date === d && l.session === sess);
+          if (!exists) {
+            mergedLogs.push({
+              id: `perm-${p.id}-${d}-${sess}`,
+              user_id: p.user_id,
+              date: d,
+              session: sess,
+              check_in_time: null,
+              check_out_time: null,
+              total_hours: 4.0,
+              status: "Present",
+              full_name: p.full_name,
+              phone_number: p.phone_number,
+              role: p.role,
+              workspace_name: p.workspace_name || "N/A"
+            });
+          }
+        });
+      });
+    });
+
+    mergedLogs.sort((a, b) => b.date.localeCompare(a.date));
+    res.json(mergedLogs);
   } catch (error) {
     res.status(500).json({ error: "Internal server error" });
   }
@@ -1108,11 +1286,46 @@ app.get("/api/attendance/dashboard", authenticateToken, (req: AuthenticatedReque
     const uniqueLateUserIds = new Set<number>();
 
     todayCheckIns.forEach(c => {
-      uniquePresentUserIds.add(c.user_id);
-      if (c.status === "Late") {
-        uniqueLateUserIds.add(c.user_id);
+      if (["Present", "Late", "Permission", "Authorized"].includes(c.status)) {
+        uniquePresentUserIds.add(c.user_id);
+        if (c.status === "Late") {
+          uniqueLateUserIds.add(c.user_id);
+        }
       }
     });
+
+    // Approved permissions count as "Present" (even if they didn't check in)
+    let approvedPermissions: any[];
+    if (currentRole === "SuperAdmin") {
+      approvedPermissions = db.prepare(`
+        SELECT user_id FROM permissions 
+        WHERE status = 'Approved' 
+        AND ? BETWEEN COALESCE(approved_from_date, start_date) AND COALESCE(approved_to_date, end_date)
+      `).all(todayStr);
+    } else {
+      approvedPermissions = db.prepare(`
+        SELECT user_id FROM permissions 
+        WHERE status = 'Approved' 
+        AND workspace_id = ?
+        AND ? BETWEEN COALESCE(approved_from_date, start_date) AND COALESCE(approved_to_date, end_date)
+      `).all(currentWorkspaceId, todayStr);
+    }
+    approvedPermissions.forEach(p => uniquePresentUserIds.add(p.user_id));
+
+    // Approved attendance requests also count as "Present"
+    let approvedAttendanceReqs: any[];
+    if (currentRole === "SuperAdmin") {
+      approvedAttendanceReqs = db.prepare(`
+        SELECT user_id FROM attendance_requests
+        WHERE status = 'Approved' AND date = ?
+      `).all(todayStr);
+    } else {
+      approvedAttendanceReqs = db.prepare(`
+        SELECT user_id FROM attendance_requests
+        WHERE status = 'Approved' AND date = ? AND workspace_id = ?
+      `).all(todayStr, currentWorkspaceId);
+    }
+    approvedAttendanceReqs.forEach(r => uniquePresentUserIds.add(r.user_id));
 
     const presentToday = uniquePresentUserIds.size;
     const lateToday = uniqueLateUserIds.size;
@@ -1276,6 +1489,10 @@ app.post("/api/permissions", authenticateToken, (req: AuthenticatedRequest, res:
     return res.status(400).json({ error: "Request type, reason, start date, and end date are required" });
   }
 
+  // Convert Gregorian dates from client to Ethiopian for storage
+  const ethStart = convertGregorianToEthiopianDate(start_date);
+  const ethEnd = convertGregorianToEthiopianDate(end_date);
+
   if (!["Permission", "Sick Leave", "Annual Leave"].includes(request_type)) {
     return res.status(400).json({ error: "Invalid request type" });
   }
@@ -1284,7 +1501,7 @@ app.post("/api/permissions", authenticateToken, (req: AuthenticatedRequest, res:
     db.prepare(`
       INSERT INTO permissions (user_id, request_type, reason, start_date, end_date, workspace_id)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(req.user?.id, request_type, reason, start_date, end_date, req.user?.workspace_id);
+    `).run(req.user?.id, request_type, reason, ethStart, ethEnd, req.user?.workspace_id);
 
     res.json({ success: true });
   } catch (error) {
@@ -1335,29 +1552,15 @@ app.put("/api/permissions/:id/approve", authenticateToken, (req: AuthenticatedRe
           for (const session of ["Morning", "Afternoon"]) {
             db.prepare(`
               INSERT INTO attendance (user_id, date, session, status, workspace_id)
-              VALUES (?, ?, ?, 'Present', ?)
+              VALUES (?, ?, ?, 'Permission', ?)
               ON CONFLICT(user_id, date, session) DO UPDATE SET
-                status = 'Present',
+                status = 'Permission',
                 updated_at = CURRENT_TIMESTAMP
             `).run(targetPermission.user_id, date, session, currentWorkspaceId);
           }
         }
       } else if (status === "Rejected") {
-        const dates = getDatesInRange(targetPermission.start_date, targetPermission.end_date);
-        for (const date of dates) {
-          for (const session of ["Morning", "Afternoon"]) {
-            db.prepare(`
-              INSERT INTO attendance (user_id, date, session, check_in_time, check_out_time, total_hours, status, workspace_id)
-              VALUES (?, ?, ?, NULL, NULL, 0, 'Absent', ?)
-              ON CONFLICT(user_id, date, session) DO UPDATE SET
-                check_in_time = NULL,
-                check_out_time = NULL,
-                total_hours = 0,
-                status = 'Absent',
-                updated_at = CURRENT_TIMESTAMP
-            `).run(targetPermission.user_id, date, session, currentWorkspaceId);
-          }
-        }
+        // Just update the status, don't overwrite existing attendance records
       }
       
       updateAttendanceScore(targetPermission.user_id);
@@ -1423,6 +1626,9 @@ app.post("/api/attendance-requests", authenticateToken, (req: AuthenticatedReque
     return res.status(400).json({ error: "Type, date, check-in, check-out, and reason are required" });
   }
 
+  // Convert Gregorian date from client to Ethiopian for storage
+  const ethDate = convertGregorianToEthiopianDate(date);
+
   if (!["Site Visit", "External Work", "Purchaser Visit"].includes(type)) {
     return res.status(400).json({ error: "Invalid attendance request type" });
   }
@@ -1431,7 +1637,7 @@ app.post("/api/attendance-requests", authenticateToken, (req: AuthenticatedReque
     db.prepare(`
       INSERT INTO attendance_requests (user_id, type, date, check_in_time, check_out_time, reason, workspace_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(req.user?.id, type, date, check_in_time, check_out_time, reason, req.user?.workspace_id);
+    `).run(req.user?.id, type, ethDate, check_in_time, check_out_time, reason, req.user?.workspace_id);
 
     res.json({ success: true });
   } catch (error) {
@@ -1472,39 +1678,49 @@ app.put("/api/attendance-requests/:id/approve", authenticateToken, (req: Authent
         WHERE id = ?
       `).run(status, id);
 
-      const activeSession = reqDetail.check_in_time < "07:00:00" ? "Morning" : "Afternoon";
+      // Determine session(s) based on check-in and check-out time
+      // Ethiopian Noon threshold is 06:00:00
+      const targetSessions: string[] = [];
+      const threshold = "06:00:00";
+      
+      const isOvernight = reqDetail.check_out_time < reqDetail.check_in_time;
+      
+      if (isOvernight) {
+        // If overnight, they definitely covered both sessions (or at least parts of them in a cycle)
+        targetSessions.push("Morning", "Afternoon");
+      } else {
+        if (reqDetail.check_in_time < threshold) targetSessions.push("Morning");
+        if (reqDetail.check_out_time > threshold) targetSessions.push("Afternoon");
+      }
+      
+      // Fallback if exactly at threshold or ambiguous
+      if (targetSessions.length === 0) targetSessions.push(reqDetail.check_in_time < threshold ? "Morning" : "Afternoon");
 
       if (status === "Approved") {
         const reqCheckIn = reqDetail.check_in_time || "02:00:00";
-        const reqCheckOut = reqDetail.check_out_time || "06:00:00";
+        const reqCheckOut = reqDetail.check_out_time || "11:00:00";
         const checkInParts = reqCheckIn.split(":");
         const checkOutParts = reqCheckOut.split(":");
         const checkInMinutes = parseInt(checkInParts[0]) * 60 + parseInt(checkInParts[1]);
         const checkOutMinutes = parseInt(checkOutParts[0]) * 60 + parseInt(checkOutParts[1]);
-        const diffMinutes = checkOutMinutes - checkInMinutes;
+        let diffMinutes = checkOutMinutes - checkInMinutes;
+        if (diffMinutes < 0) diffMinutes += 24 * 60; // Handle overnight shifts
         const totalHours = Math.max(0, parseFloat((diffMinutes / 60).toFixed(2)));
 
-        db.prepare(`
-          INSERT INTO attendance (user_id, date, session, check_in_time, check_out_time, total_hours, status, workspace_id)
-          VALUES (?, ?, ?, ?, ?, ?, 'Present', ?)
-          ON CONFLICT(user_id, date, session) DO UPDATE SET
-            check_in_time = excluded.check_in_time,
-            check_out_time = excluded.check_out_time,
-            total_hours = excluded.total_hours,
-            status = 'Present',
-            updated_at = CURRENT_TIMESTAMP
-        `).run(reqDetail.user_id, reqDetail.date, activeSession, reqDetail.check_in_time, reqDetail.check_out_time, totalHours, currentWorkspaceId);
+        for (const session of targetSessions) {
+          db.prepare(`
+            INSERT INTO attendance (user_id, date, session, check_in_time, check_out_time, total_hours, status, workspace_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'Authorized', ?)
+            ON CONFLICT(user_id, date, session) DO UPDATE SET
+              check_in_time = excluded.check_in_time,
+              check_out_time = excluded.check_out_time,
+              total_hours = excluded.total_hours,
+              status = 'Authorized',
+              updated_at = CURRENT_TIMESTAMP
+          `).run(reqDetail.user_id, reqDetail.date, session, reqDetail.check_in_time, reqDetail.check_out_time, totalHours, currentWorkspaceId);
+        }
       } else if (status === "Rejected") {
-        db.prepare(`
-          INSERT INTO attendance (user_id, date, session, check_in_time, check_out_time, total_hours, status, workspace_id)
-          VALUES (?, ?, ?, NULL, NULL, 0, 'Absent', ?)
-          ON CONFLICT(user_id, date, session) DO UPDATE SET
-            check_in_time = NULL,
-            check_out_time = NULL,
-            total_hours = 0,
-            status = 'Absent',
-            updated_at = CURRENT_TIMESTAMP
-        `).run(reqDetail.user_id, reqDetail.date, activeSession, currentWorkspaceId);
+        // Just update the status, don't overwrite existing attendance records
       }
 
       updateAttendanceScore(reqDetail.user_id);
@@ -1695,6 +1911,12 @@ app.post("/api/qr-code/regenerate", authenticateToken, (req: AuthenticatedReques
 
 // --- VITE DEV AND BUILD HANDLERS ---
 async function startServer() {
+  // Catch-all for undefined /api routes to return JSON instead of HTML
+  app.all("/api/*", (req, res) => {
+    console.log(`Unmatched API route: ${req.method} ${req.url}`);
+    res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
+  });
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1713,5 +1935,11 @@ async function startServer() {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }
+
+// Global error handler
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error (Global Handler)" });
+});
 
 startServer();

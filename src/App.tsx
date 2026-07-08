@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { useAppStore } from "./store.js";
 import { QRCodeSVG } from "qrcode.react";
+import { QRScanner } from "./components/QRScanner";
+import { Footer } from "./components/Footer";
 import { toEthiopian } from "ethiopian-date";
 import { 
   Briefcase, 
@@ -276,12 +278,15 @@ export default function App() {
   const [editOfficeName, setEditOfficeName] = useState("Main Head Office");
   const [editLatitude, setEditLatitude] = useState("9.0227");
   const [editLongitude, setEditLongitude] = useState("38.7460");
-  const [editWifiSsid, setEditWifiSsid] = useState("BsquareY_WiFi");
+  const [editWifiSsid, setEditWifiSsid] = useState("NabiTech_WiFi");
   const [editWifiIp, setEditWifiIp] = useState("192.168.1.100");
   const [editUseWifi, setEditUseWifi] = useState(true);
 
   // Public IP tracking for auto-compliance verification
   const [currentPublicIp, setCurrentPublicIp] = useState<string>("");
+  const [isScanningQR, setIsScanningQR] = useState(false);
+  const [isCheckoutScan, setIsCheckoutScan] = useState(false);
+  const [pendingLocData, setPendingLocData] = useState<any>(null);
   const [notification, setNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   const triggerNotification = (type: "success" | "error", msg: string) => {
@@ -300,7 +305,7 @@ export default function App() {
   // Filters
   const [dashboardFilter, setDashboardFilter] = useState<string>("Month");
   const [salaryFilter, setSalaryFilter] = useState<string>("Monthly");
-  const [feedFilter, setFeedFilter] = useState<"All" | "Present" | "Late" | "Absent">("All");
+  const [feedFilter, setFeedFilter] = useState<"All" | "Present" | "Late" | "Absent" | "Permission">("All");
 
   // Registration states
   const [regName, setRegName] = useState("");
@@ -366,7 +371,7 @@ export default function App() {
   const [selectedEmployeeTab, setSelectedEmployeeTab] = useState<"today" | "weekly" | "monthly" | "yearly">("today");
   const [selectedDetailMonth, setSelectedDetailMonth] = useState<string>("");
   const [modalSearchTerm, setModalSearchTerm] = useState("");
-  const [modalStatusFilter, setModalStatusFilter] = useState<"All" | "Present" | "Late" | "Absent">("All");
+  const [modalStatusFilter, setModalStatusFilter] = useState<"All" | "Present" | "Late" | "Absent" | "Permission">("All");
   const [modalCustomRate, setModalCustomRate] = useState<string>("");
 
   // Delete Employee Confirmation state
@@ -612,144 +617,144 @@ export default function App() {
   };
 
   // Real check-in with auto-detected compliance checking
-  const handleRealScan = (session?: "Morning" | "Afternoon") => {
-    if (!qrCode) {
-      triggerNotification("error", "No active site QR Code found in database.");
+  const handleRealScan = async (session?: "Morning" | "Afternoon") => {
+    setIsScanning(true);
+    setScanMessage("Verifying office Wi-Fi network...");
+    
+    let wifi_ip: string | undefined = undefined;
+    try {
+      const ipRes = await fetch("https://api.ipify.org?format=json");
+      const ipData = await ipRes.json();
+      wifi_ip = ipData.ip;
+      if (wifi_ip) setCurrentPublicIp(wifi_ip);
+    } catch (err) {}
+
+    // 1. Try Wi-Fi first (send no QR code)
+    const res = await checkIn(undefined, { wifi_ip, session } as any);
+    
+    if (res.success) {
+      setIsScanning(false);
+      triggerNotification("success", `Checked In Successfully via Wi-Fi to ${res.session || "detected"} session!`);
       return;
     }
-    setIsScanning(true);
-    setScanMessage("Contacting network and satellite systems...");
-    setTimeout(() => {
-      setScanMessage("Acquiring GPS fix and checking local network...");
-      setTimeout(async () => {
-        let latitude: number | undefined = undefined;
-        let longitude: number | undefined = undefined;
-        let accuracy: number | undefined = undefined;
-        let wifi_ssid: string | undefined = undefined;
-        let wifi_ip: string | undefined = undefined;
 
-        try {
-          const ipRes = await fetch("https://api.ipify.org?format=json");
-          const ipData = await ipRes.json();
-          wifi_ip = ipData.ip;
-          if (wifi_ip) {
-            setCurrentPublicIp(wifi_ip);
-          }
-        } catch (err) {
-          console.warn("Could not auto-detect public IP client-side:", err);
-        }
-
-        setScanMessage("Requesting device location parameters...");
-        try {
-          const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject, {
-              enableHighAccuracy: true,
-              timeout: 10000
-            });
+    // 2. If it failed because Wi-Fi not detected, start GPS + QR fallback
+    if (res.error?.includes("Office Wi-Fi not detected")) {
+      setScanMessage("Wi-Fi not detected. Switching to GPS + QR fallback...");
+      
+      try {
+        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 10000
           });
-          latitude = pos.coords.latitude;
-          longitude = pos.coords.longitude;
-          accuracy = pos.coords.accuracy;
-          
-          setScanMessage(`Scanning QR Token: ${qrCode.code}...`);
-          
-          const res = await checkIn(qrCode.code, {
-            latitude,
-            longitude,
-            accuracy,
-            wifi_ssid,
-            wifi_ip,
-            session
-          } as any);
+        });
+        
+        const locData = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          wifi_ip,
+          session
+        };
 
+        // Artificial delay for UX
+        setTimeout(() => {
           setIsScanning(false);
-          if (res.success) {
-            triggerNotification("success", `Checked In Successfully to ${res.session || "detected"} session!`);
-          } else {
-            triggerNotification("error", `Check-In Failed: ${res.error || "Expired or invalid QR"}`);
-          }
-        } catch (err: any) {
-          setIsScanning(false);
-          let errorMsg = "Could not acquire a secure GPS lock.";
-          if (err.code === 1) {
-            errorMsg = "Location access denied. Please enable Location permissions in your browser settings to verify your on-site attendance.";
-          } else if (err.code === 2) {
-            errorMsg = "Position unavailable. Please ensure your device has GPS signal/Internet.";
-          } else if (err.code === 3) {
-            errorMsg = "Location acquisition timed out. Please try scanning again.";
-          }
-          triggerNotification("error", errorMsg);
-        }
-      }, 1200);
-    }, 1000);
+          setPendingLocData(locData);
+          setIsScanningQR(true);
+          setIsCheckoutScan(false);
+        }, 800);
+      } catch (err: any) {
+        setIsScanning(false);
+        let errorMsg = "GPS fallback failed: Could not acquire location lock.";
+        if (err.code === 1) errorMsg = "Location access denied. Please enable GPS to use QR fallback.";
+        triggerNotification("error", errorMsg);
+      }
+    } else {
+      setIsScanning(false);
+      triggerNotification("error", res.error || "Check-In Failed");
+    }
   };
 
   // Real check-out with auto-detected compliance checking
-  const handleRealCheckOut = (session?: "Morning" | "Afternoon") => {
+  const handleRealCheckOut = async (session?: "Morning" | "Afternoon") => {
     setIsScanning(true);
-    setScanMessage("Verifying local office network or GPS geofence...");
-    setTimeout(() => {
-      setScanMessage("Resolving office position and matching subnet parameters...");
-      setTimeout(async () => {
-        let latitude: number | undefined = undefined;
-        let longitude: number | undefined = undefined;
-        let accuracy: number | undefined = undefined;
-        let wifi_ssid: string | undefined = undefined;
-        let wifi_ip: string | undefined = undefined;
+    setScanMessage("Verifying office Wi-Fi network...");
+    
+    let wifi_ip: string | undefined = undefined;
+    try {
+      const ipRes = await fetch("https://api.ipify.org?format=json");
+      const ipData = await ipRes.json();
+      wifi_ip = ipData.ip;
+    } catch (err) {}
 
-        try {
-          const ipRes = await fetch("https://api.ipify.org?format=json");
-          const ipData = await ipRes.json();
-          wifi_ip = ipData.ip;
-          if (wifi_ip) {
-            setCurrentPublicIp(wifi_ip);
-          }
-        } catch (err) {
-          console.warn("Could not auto-detect public IP client-side:", err);
-        }
+    // 1. Try Wi-Fi first
+    const res = await checkOut(undefined, { wifi_ip, session } as any);
+    
+    if (res.success) {
+      setIsScanning(false);
+      triggerNotification("success", `Checked Out Successfully via Wi-Fi from ${res.session || "detected"} session!`);
+      return;
+    }
 
-        setScanMessage("Requesting device location parameters...");
-        try {
-          const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject, {
-              enableHighAccuracy: true,
-              timeout: 10000
-            });
+    // 2. If it failed because Wi-Fi not detected, start GPS + QR fallback
+    if (res.error?.includes("Office Wi-Fi not detected")) {
+      setScanMessage("Wi-Fi not detected. Switching to GPS + QR fallback...");
+      
+      try {
+        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 10000
           });
-          latitude = pos.coords.latitude;
-          longitude = pos.coords.longitude;
-          accuracy = pos.coords.accuracy;
+        });
+        
+        const locData = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          wifi_ip,
+          session
+        };
 
-          setScanMessage("Authenticating Check-Out...");
-
-          const res = await checkOut({
-            latitude,
-            longitude,
-            accuracy,
-            wifi_ssid,
-            wifi_ip,
-            session
-          } as any);
-
+        setTimeout(() => {
           setIsScanning(false);
-          if (res.success) {
-            triggerNotification("success", `Checked Out Successfully from ${res.session || "detected"} session!`);
-          } else {
-            triggerNotification("error", `Check-Out Failed: ${res.error || "Compliance conditions not met"}`);
-          }
-        } catch (err: any) {
-          setIsScanning(false);
-          let errorMsg = "Could not acquire a secure GPS lock.";
-          if (err.code === 1) {
-            errorMsg = "Location access denied. Please allow location permissions to check out of your site.";
-          } else if (err.code === 2) {
-            errorMsg = "Position unavailable. Please ensure your device has GPS signal/Internet.";
-          } else if (err.code === 3) {
-            errorMsg = "Location acquisition timed out. Please try again.";
-          }
-          triggerNotification("error", errorMsg);
-        }
-      }, 1200);
+          setPendingLocData(locData);
+          setIsScanningQR(true);
+          setIsCheckoutScan(true);
+        }, 800);
+      } catch (err: any) {
+        setIsScanning(false);
+        let errorMsg = "GPS fallback failed: Could not acquire location lock.";
+        if (err.code === 1) errorMsg = "Location access denied. Please enable GPS to use QR fallback.";
+        triggerNotification("error", errorMsg);
+      }
+    } else {
+      setIsScanning(false);
+      triggerNotification("error", res.error || "Check-Out Failed");
+    }
+  };
+
+  const handleQRScanSuccess = async (decodedText: string) => {
+    setIsScanningQR(false);
+    setIsScanning(true);
+    setScanMessage("Validating scanned token and location...");
+
+    // Delay slightly to show validating message
+    setTimeout(async () => {
+      const res = isCheckoutScan 
+        ? await checkOut(decodedText, pendingLocData)
+        : await checkIn(decodedText, pendingLocData);
+
+      setIsScanning(false);
+      setPendingLocData(null);
+
+      if (res.success) {
+        triggerNotification("success", `${isCheckoutScan ? "Checked Out" : "Checked In"} Successfully!`);
+      } else {
+        triggerNotification("error", res.error || "Verification failed.");
+      }
     }, 1000);
   };
 
@@ -782,7 +787,7 @@ export default function App() {
             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-600 text-white mb-4 shadow-lg shadow-blue-500/20">
               <Briefcase size={28} />
             </div>
-            <h1 className="text-2xl font-bold text-[#0F172A] tracking-tight">B square Y Attendance</h1>
+            <h1 className="text-2xl font-bold text-[#0F172A] tracking-tight">Nabi Tech PLC Attendance</h1>
             <p className="text-gray-500 text-sm mt-1">
               {isDbEmpty ? "Initial Admin Account Configuration" : "Attendance Management Control Panel"}
             </p>
@@ -791,7 +796,7 @@ export default function App() {
           {isDbEmpty ? (
             <form onSubmit={handleSetupSubmit} className="space-y-5">
               <div className="p-3.5 bg-blue-50 border border-blue-100 text-blue-800 rounded-xl text-xs font-bold leading-normal">
-                Welcome to B square Y Attendance! The database is empty. Please set up the default Administrator account to continue.
+                Welcome to Nabi Tech PLC Attendance! The database is empty. Please set up the default Administrator account to continue.
               </div>
 
               {setupErr && (
@@ -1685,7 +1690,7 @@ export default function App() {
               )}
             </h1>
             <p className="text-[10px] md:text-xs text-slate-400 font-medium">
-              B square Y Attendance Panel ({user.role === "AdminManager" ? "Second Admin" : user.role === "AdminCreator" ? "Normal Admin" : user.role})
+              Nabi Tech PLC Attendance Panel ({user.role === "AdminManager" ? "Second Admin" : user.role === "AdminCreator" ? "Normal Admin" : user.role})
             </p>
           </div>
         </div>
@@ -1724,13 +1729,13 @@ export default function App() {
             isMobileMenuOpen ? "translate-x-0" : "-translate-x-full"
           }`}
         >
-          <div className="space-y-6">
+          <div className="space-y-6 overflow-y-auto pr-1 flex-1">
             <div className="flex justify-between items-center pb-4 border-b border-gray-100">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 bg-blue-600 text-white rounded-lg flex items-center justify-center font-bold text-sm">
                   B
                 </div>
-                <span className="font-bold text-slate-800 text-sm">B square Y Navigation</span>
+                <span className="font-bold text-slate-800 text-sm">Nabi Tech PLC Navigation</span>
               </div>
               <button 
                 onClick={() => setIsMobileMenuOpen(false)}
@@ -1852,8 +1857,8 @@ export default function App() {
         </aside>
 
         {/* Desktop Navigation Sidebar */}
-        <aside className="hidden md:flex w-64 bg-white border-r border-gray-100 p-5 flex-col justify-between shrink-0">
-          <div className="space-y-6">
+        <aside className="hidden md:flex w-64 bg-white border-r border-gray-100 p-5 flex-col justify-between shrink-0 h-screen sticky top-0">
+          <div className="space-y-6 overflow-y-auto pr-1 flex-1">
             {user?.workspace_name && (
               <div className="bg-blue-50/50 border border-blue-100 rounded-2xl p-4 space-y-1">
                 <div className="text-[10px] font-extrabold text-blue-600 uppercase tracking-widest flex items-center gap-1">
@@ -2115,16 +2120,17 @@ export default function App() {
                     <h3 className="text-sm font-bold text-[#0F172A]">Today's Shift Feed</h3>
                     <p className="text-[11px] text-gray-500 mt-0.5">Live attendance and session breakdowns for employee shifts</p>
                   </div>
-                  <div className="flex gap-1 bg-slate-50 border border-slate-200 p-1 rounded-xl shrink-0">
-                    {(["All", "Present", "Late", "Absent"] as const).map((opt) => (
+                  <div className="flex gap-1 bg-slate-50 border border-slate-200 p-1 rounded-xl shrink-0 overflow-x-auto">
+                    {(["All", "Present", "Late", "Absent", "Permission"] as const).map((opt) => (
                       <button
                         key={opt}
                         onClick={() => setFeedFilter(opt)}
-                        className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition ${
+                        className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition whitespace-nowrap ${
                           feedFilter === opt 
                             ? opt === "Present" ? "bg-emerald-600 text-white"
                               : opt === "Late" ? "bg-amber-500 text-white"
                               : opt === "Absent" ? "bg-rose-500 text-white"
+                              : opt === "Permission" ? "bg-blue-600 text-white"
                               : "bg-slate-700 text-white"
                             : "text-gray-500 hover:text-gray-700"
                         }`}
@@ -2152,6 +2158,17 @@ export default function App() {
                         const todayStr = getEthiopianDateString();
                         const todayLogs = attendanceHistory.filter(h => h.date === todayStr);
                         
+                        // Approved permissions and attendance requests for today
+                        const todayPermissions = permissions.filter(p => 
+                          p.status === "Approved" && 
+                          todayStr >= p.start_date && 
+                          todayStr <= p.end_date
+                        );
+                        const todayAttendanceReqs = attendanceRequests.filter(r =>
+                          r.status === "Approved" &&
+                          r.date === todayStr
+                        );
+
                         // Group logs by user_id, pre-populated with all registered employees of role 'Employee', etc.
                         const groupedTodayLogs: Record<number, {
                           user_id: number;
@@ -2159,6 +2176,8 @@ export default function App() {
                           role: string;
                           morning: any;
                           afternoon: any;
+                          approvedPermission: any;
+                          approvedAttendanceReq: any;
                         }> = {};
 
                         const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
@@ -2169,6 +2188,8 @@ export default function App() {
                             role: e.role || "Employee",
                             morning: null,
                             afternoon: null,
+                            approvedPermission: todayPermissions.find(p => p.user_id === e.id) || null,
+                            approvedAttendanceReq: todayAttendanceReqs.find(r => r.user_id === e.id) || null,
                           };
                         });
 
@@ -2194,11 +2215,26 @@ export default function App() {
 
                         // Apply the dashboard card filter
                         if (feedFilter === "Present") {
-                          groupedList = groupedList.filter(g => g.morning !== null || g.afternoon !== null);
+                          groupedList = groupedList.filter(g => 
+                            (g.morning && ["Present", "Late", "Authorized"].includes(g.morning.status)) || 
+                            (g.afternoon && ["Present", "Late", "Authorized"].includes(g.afternoon.status))
+                          );
                         } else if (feedFilter === "Late") {
                           groupedList = groupedList.filter(g => g.morning?.status === "Late" || g.afternoon?.status === "Late");
                         } else if (feedFilter === "Absent") {
-                          groupedList = groupedList.filter(g => g.morning === null && g.afternoon === null);
+                          groupedList = groupedList.filter(g => 
+                            (!g.morning || g.morning.status === "Absent") && 
+                            (!g.afternoon || g.afternoon.status === "Absent") &&
+                            !g.approvedPermission && 
+                            !g.approvedAttendanceReq
+                          );
+                        } else if (feedFilter === "Permission") {
+                          groupedList = groupedList.filter(g => 
+                            g.approvedPermission || 
+                            g.approvedAttendanceReq || 
+                            g.morning?.status === "Permission" || 
+                            g.afternoon?.status === "Permission"
+                          );
                         }
 
                         if (groupedList.length === 0) {
@@ -2226,19 +2262,29 @@ export default function App() {
                               
                               {/* Morning Session Column */}
                               <td className="p-3.5">
-                                {g.morning ? (
+                                {g.morning && (g.morning.status !== "Absent") ? (
                                   <div className="flex flex-col gap-0.5">
                                     <div className="flex items-center gap-1">
                                       <span className="text-[9px] text-gray-400 uppercase font-extrabold w-6">In:</span>
-                                      <span className="font-mono text-xs text-slate-800">{g.morning.check_in_time || "--"}</span>
+                                      <span className="font-mono text-xs text-slate-800">
+                                        {g.morning.check_in_time || (g.morning.status === "Permission" ? "On Leave" : "Authorized")}
+                                      </span>
                                     </div>
                                     <div className="flex items-center gap-1">
                                       <span className="text-[9px] text-gray-400 uppercase font-extrabold w-6">Out:</span>
                                       <span className="font-mono text-xs text-slate-800">
-                                        {g.morning.check_out_time || (g.morning.check_in_time ? "Active" : "--")}
+                                        {g.morning.check_out_time || (g.morning.check_in_time ? "Active" : "Approved")}
                                       </span>
                                     </div>
                                   </div>
+                                ) : g.approvedPermission ? (
+                                  <span className="text-blue-600 bg-blue-50 border border-blue-100 rounded-lg px-2 py-0.5 font-bold text-[10px] flex items-center gap-1">
+                                    <CheckCircle className="w-3 h-3" /> {g.approvedPermission.request_type}
+                                  </span>
+                                ) : g.approvedAttendanceReq ? (
+                                  <span className="text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-lg px-2 py-0.5 font-bold text-[10px] flex items-center gap-1">
+                                    <MapPin className="w-3 h-3" /> {g.approvedAttendanceReq.type}
+                                  </span>
                                 ) : (
                                   <span className="text-rose-600 bg-rose-50 border border-rose-100 rounded-lg px-2 py-0.5 font-bold text-[10px]">Absent</span>
                                 )}
@@ -2246,21 +2292,31 @@ export default function App() {
 
                               {/* Afternoon Session Column */}
                               <td className="p-3.5">
-                                {g.afternoon ? (
+                                {g.afternoon && (g.afternoon.status !== "Absent") ? (
                                   <div className="flex flex-col gap-0.5">
                                     <div className="flex items-center gap-1">
                                       <span className="text-[9px] text-gray-400 uppercase font-extrabold w-6">In:</span>
-                                      <span className="font-mono text-xs text-slate-800">{g.afternoon.check_in_time || "--"}</span>
+                                      <span className="font-mono text-xs text-slate-800">
+                                        {g.afternoon.check_in_time || (g.afternoon.status === "Permission" ? "On Leave" : "Authorized")}
+                                      </span>
                                     </div>
                                     <div className="flex items-center gap-1">
                                       <span className="text-[9px] text-gray-400 uppercase font-extrabold w-6">Out:</span>
                                       <span className="font-mono text-xs text-slate-800">
-                                        {g.afternoon.check_out_time || (g.afternoon.check_in_time ? "Active" : "--")}
+                                        {g.afternoon.check_out_time || (g.afternoon.check_in_time ? "Active" : "Approved")}
                                       </span>
                                     </div>
                                   </div>
                                 ) : isMorningNow ? (
                                   <span className="text-gray-300 font-normal">-</span>
+                                ) : g.approvedPermission ? (
+                                  <span className="text-blue-600 bg-blue-50 border border-blue-100 rounded-lg px-2 py-0.5 font-bold text-[10px] flex items-center gap-1">
+                                    <CheckCircle className="w-3 h-3" /> {g.approvedPermission.request_type}
+                                  </span>
+                                ) : g.approvedAttendanceReq ? (
+                                  <span className="text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-lg px-2 py-0.5 font-bold text-[10px] flex items-center gap-1">
+                                    <MapPin className="w-3 h-3" /> {g.approvedAttendanceReq.type}
+                                  </span>
                                 ) : (
                                   <span className="text-rose-600 bg-rose-50 border border-rose-100 rounded-lg px-2 py-0.5 font-bold text-[10px]">Absent</span>
                                 )}
@@ -2272,11 +2328,19 @@ export default function App() {
                                 <div className="flex flex-col gap-1">
                                   {g.morning ? (
                                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max ${
-                                      g.morning.status === "Present" ? "bg-emerald-50 text-emerald-600 border border-emerald-100" :
+                                      ["Present", "Permission", "Authorized"].includes(g.morning.status) ? "bg-emerald-50 text-emerald-600 border border-emerald-100" :
                                       g.morning.status === "Late" ? "bg-amber-50 text-amber-600 border border-amber-100" :
                                       "bg-rose-50 text-rose-600 border border-rose-100"
                                     }`}>
                                       AM: {g.morning.status}
+                                    </span>
+                                  ) : g.approvedPermission ? (
+                                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-blue-50 text-blue-600 border border-blue-100">
+                                      AM: {g.approvedPermission.request_type}
+                                    </span>
+                                  ) : g.approvedAttendanceReq ? (
+                                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-indigo-50 text-indigo-600 border border-indigo-100">
+                                      AM: {g.approvedAttendanceReq.type}
                                     </span>
                                   ) : (
                                     <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-rose-50 text-rose-600 border border-rose-100">
@@ -2285,13 +2349,21 @@ export default function App() {
                                   )}
                                   {g.afternoon ? (
                                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max ${
-                                      g.afternoon.status === "Present" ? "bg-indigo-50 text-indigo-600 border border-indigo-100" :
+                                      ["Present", "Permission", "Authorized"].includes(g.afternoon.status) ? "bg-indigo-50 text-indigo-600 border border-indigo-100" :
                                       g.afternoon.status === "Late" ? "bg-amber-50 text-amber-600 border border-amber-100" :
                                       "bg-rose-50 text-rose-600 border border-rose-100"
                                     }`}>
                                       PM: {g.afternoon.status}
                                     </span>
-                                  ) : isMorningNow ? null : (
+                                  ) : isMorningNow ? null : g.approvedPermission ? (
+                                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-blue-50 text-blue-600 border border-blue-100">
+                                      PM: {g.approvedPermission.request_type}
+                                    </span>
+                                  ) : g.approvedAttendanceReq ? (
+                                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-indigo-50 text-indigo-600 border border-indigo-100">
+                                      PM: {g.approvedAttendanceReq.type}
+                                    </span>
+                                  ) : (
                                     <span className="px-1.5 py-0.5 rounded text-[9px] font-bold inline-block w-max bg-rose-50 text-rose-600 border border-rose-100">
                                       PM: Absent
                                     </span>
@@ -2644,10 +2716,10 @@ export default function App() {
                 const totalHours = parseFloat(filteredPeriodLogs.reduce((sum, l) => sum + (l.total_hours || 0), 0).toFixed(2));
                 const totalDays = filteredPeriodLogs.length;
                 const uniqueDaysLogged = new Set(filteredPeriodLogs.map(l => l.date)).size;
-                const presentCount = filteredPeriodLogs.filter(l => l.status === "Present").length;
+                const presentCount = filteredPeriodLogs.filter(l => ["Present", "Permission", "Authorized"].includes(l.status)).length;
                 const lateCount = filteredPeriodLogs.filter(l => l.status === "Late").length;
                 const absentCount = filteredPeriodLogs.filter(l => l.status === "Absent").length;
-                const punctuality = totalDays > 0 ? Math.round((presentCount / totalDays) * 100) : 100;
+                const punctuality = totalDays > 0 ? Math.round(((presentCount + lateCount) / totalDays) * 100) : 100;
 
                 // Session breakdowns
                 const morningLogs = filteredPeriodLogs.filter(l => l.session === "Morning");
@@ -3011,8 +3083,8 @@ export default function App() {
                                         const mRec = dayLogs.find(l => l.session === "Morning");
                                         const aRec = dayLogs.find(l => l.session === "Afternoon");
 
-                                        const isMPresent = mRec && (mRec.status === "Present" || mRec.status === "Late");
-                                        const isAPresent = aRec && (aRec.status === "Present" || aRec.status === "Late");
+                                        const isMPresent = mRec && ["Present", "Late", "Permission", "Authorized"].includes(mRec.status);
+                                        const isAPresent = aRec && ["Present", "Late", "Permission", "Authorized"].includes(aRec.status);
 
                                         return (
                                           <div 
@@ -3153,12 +3225,14 @@ export default function App() {
                                                 {log.session || "Morning"}
                                               </span>
                                             </td>
-                                            <td className="p-3 font-mono text-slate-600">{log.check_in_time || "--"}</td>
-                                            <td className="p-3 font-mono text-slate-600">{log.check_out_time || "Active"}</td>
+                                            <td className="p-3 font-mono text-slate-600">{log.check_in_time || (log.status === "Present" ? "Authorized" : "--")}</td>
+                                            <td className="p-3 font-mono text-slate-600">{log.check_out_time || (log.status === "Present" && !log.check_in_time ? "Permission" : "Active")}</td>
                                             <td className="p-3 font-bold text-slate-800">{log.total_hours} hrs</td>
                                             <td className="p-3 text-right">
                                               <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                                log.status === "Present" ? "bg-emerald-50 text-emerald-600 border border-emerald-100" : "bg-amber-50 text-amber-600 border border-amber-100"
+                                                log.status === "Present" ? "bg-emerald-50 text-emerald-600 border border-emerald-100" : 
+                                                log.status === "Late" ? "bg-amber-50 text-amber-600 border border-amber-100" :
+                                                "bg-rose-50 text-rose-600 border border-rose-100"
                                               }`}>
                                                 {log.status}
                                               </span>
@@ -3282,31 +3356,19 @@ export default function App() {
                           <div className="flex gap-2">
                             {!morningRecord ? (
                               <button
-                                onClick={async () => {
-                                  const res = await checkIn(undefined, { session: "Morning" } as any);
-                                  if (res.success) {
-                                    triggerNotification("success", "Morning Checked In Successfully!");
-                                  } else {
-                                    triggerNotification("error", res.error || "Failed to check in Morning.");
-                                  }
-                                }}
-                                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition"
+                                onClick={() => handleRealScan("Morning")}
+                                disabled={isScanning}
+                                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
                               >
-                                Check In Morning
+                                {isScanning ? "Processing..." : "Check In Morning"}
                               </button>
                             ) : !morningRecord.check_out_time ? (
                               <button
-                                onClick={async () => {
-                                  const res = await checkOut({ session: "Morning" } as any);
-                                  if (res.success) {
-                                    triggerNotification("success", "Morning Checked Out Successfully!");
-                                  } else {
-                                    triggerNotification("error", res.error || "Failed to check out Morning.");
-                                  }
-                                }}
-                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition"
+                                onClick={() => handleRealCheckOut("Morning")}
+                                disabled={isScanning}
+                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
                               >
-                                Check Out Morning
+                                {isScanning ? "Processing..." : "Check Out Morning"}
                               </button>
                             ) : (
                               <span className="text-emerald-600 font-bold text-xs p-2 bg-emerald-50 border border-emerald-100 rounded-lg">Morning Completed</span>
@@ -3319,31 +3381,19 @@ export default function App() {
                           <div className="flex gap-2">
                             {!afternoonRecord ? (
                               <button
-                                onClick={async () => {
-                                  const res = await checkIn(undefined, { session: "Afternoon" } as any);
-                                  if (res.success) {
-                                    triggerNotification("success", "Afternoon Checked In Successfully!");
-                                  } else {
-                                    triggerNotification("error", res.error || "Failed to check in Afternoon.");
-                                  }
-                                }}
-                                className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition"
+                                onClick={() => handleRealScan("Afternoon")}
+                                disabled={isScanning}
+                                className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
                               >
-                                Check In Afternoon
+                                {isScanning ? "Processing..." : "Check In Afternoon"}
                               </button>
                             ) : !afternoonRecord.check_out_time ? (
                               <button
-                                onClick={async () => {
-                                  const res = await checkOut({ session: "Afternoon" } as any);
-                                  if (res.success) {
-                                    triggerNotification("success", "Afternoon Checked Out Successfully!");
-                                  } else {
-                                    triggerNotification("error", res.error || "Failed to check out Afternoon.");
-                                  }
-                                }}
-                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition"
+                                onClick={() => handleRealCheckOut("Afternoon")}
+                                disabled={isScanning}
+                                className="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2 px-4 rounded-xl text-xs transition disabled:opacity-50"
                               >
-                                Check Out Afternoon
+                                {isScanning ? "Processing..." : "Check Out Afternoon"}
                               </button>
                             ) : (
                               <span className="text-emerald-600 font-bold text-xs p-2 bg-emerald-50 border border-emerald-100 rounded-lg">Afternoon Completed</span>
@@ -3793,8 +3843,8 @@ export default function App() {
                           return filtered.map((emp) => {
                             const isCurrentUser = emp.id === user?.id;
                             const employeeRoles = ["Employee", "Purchaser", "Accountant", "Engineer", "HR"];
-                            const isEditable = !(user?.role === "AdminManager" && !employeeRoles.includes(emp.role));
-                            const isDeletable = !isCurrentUser && !(user?.role === "AdminManager" && !employeeRoles.includes(emp.role));
+                            const isEditable = !(user?.role === "AdminManager" && !employeeRoles.includes(emp.role || "Employee"));
+                            const isDeletable = !isCurrentUser && !(user?.role === "AdminManager" && !employeeRoles.includes(emp.role || "Employee"));
 
                             return (
                               <tr key={emp.id} className="hover:bg-slate-50 transition">
@@ -3811,12 +3861,12 @@ export default function App() {
                                 <td className="p-3 text-gray-500 font-mono text-[11px]">{emp.phone_number}</td>
                                 <td className="p-3">
                                   <span className={`inline-flex items-center gap-1 text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
-                                    !employeeRoles.includes(emp.role) 
+                                    !employeeRoles.includes(emp.role || "Employee") 
                                       ? "bg-blue-50 text-blue-700 border border-blue-100" 
                                       : "bg-slate-50 text-slate-700 border border-slate-100"
                                   }`}>
-                                    <span className={`w-1.5 h-1.5 rounded-full ${!employeeRoles.includes(emp.role) ? "bg-blue-500" : "bg-slate-500"}`} />
-                                    {emp.role}
+                                    <span className={`w-1.5 h-1.5 rounded-full ${!employeeRoles.includes(emp.role || "Employee") ? "bg-blue-500" : "bg-slate-500"}`} />
+                                    {emp.role || "Employee"}
                                   </span>
                                 </td>
                                 <td className="p-3 font-bold text-gray-600">${emp.hourly_rate?.toFixed(2)}/hr</td>
@@ -3833,7 +3883,7 @@ export default function App() {
                                           setEditingEmpId(emp.id);
                                           setEditEmpName(emp.full_name);
                                           setEditEmpPhone(emp.phone_number);
-                                          setEditEmpRole(emp.role);
+                                          setEditEmpRole(emp.role || "Employee");
                                           setEditEmpRate(emp.hourly_rate?.toString() || "25.00");
                                           setEditEmpPass("");
                                         }}
@@ -4276,7 +4326,7 @@ export default function App() {
                         <label className="text-xs font-bold text-gray-500">Authorized Office WiFi SSID</label>
                         <input
                           type="text"
-                          placeholder="e.g. BsquareY_WiFi"
+                          placeholder="e.g. NabiTech_WiFi"
                           value={editWifiSsid}
                           onChange={(e) => setEditWifiSsid(e.target.value)}
                           className="w-full px-4 py-2 bg-slate-50 border border-gray-200 rounded-lg text-xs font-semibold focus:bg-white focus:outline-none"
@@ -4329,6 +4379,15 @@ export default function App() {
             </div>
           )}
         </main>
+
+        <Footer />
+
+        {isScanningQR && (
+          <QRScanner 
+            onScanSuccess={handleQRScanSuccess} 
+            onClose={() => setIsScanningQR(false)} 
+          />
+        )}
 
 
       </div>
